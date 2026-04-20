@@ -37,6 +37,11 @@ npm run dev
 
 Open `http://localhost:5173` in your browser. 
 
+## Deploy on Vercel
+Deployment is pre-configured and automatic. Simply import this repository to Vercel. 
+- During setup, add `DOCSTRANGE_API_KEY` to your Vercel project's Environment Variables.
+- Vercel will automatically use `vercel.json` to proxy Nanonets requests seamlessly, so the app will run securely in production with no CORS errors or manual routing adjustments.
+
 ## Project structure
 
 ```
