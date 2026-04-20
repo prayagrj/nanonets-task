@@ -1,4 +1,10 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
+import * as pdfjsLib from "pdfjs-dist";
+import pdfjsWorker from "pdfjs-dist/build/pdf.worker?url";
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
+
+const toTitleCase = (s) => s.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 
 const TYPE_COLORS = {
   document_title:  { fill: "rgba(239,68,68,0.18)",    stroke: "#ef4444", label: "Document Title" },
@@ -20,7 +26,6 @@ const TYPE_COLORS = {
   default:         { fill: "rgba(99,102,241,0.13)",   stroke: "#6366f1", label: "Other" },
 };
 
-// ─── Upload screen ────────────────────────────────────────────────────────────
 function UploadScreen({ onFile }) {
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef(null);
@@ -62,7 +67,6 @@ function UploadScreen({ onFile }) {
   );
 }
 
-// ─── File confirm screen ───────────────────────────────────────────────────────
 function ConfirmScreen({ file, onExtract, onReset, loading, error }) {
   return (
     <div style={S.uploadScreen}>
@@ -91,7 +95,6 @@ function ConfirmScreen({ file, onExtract, onReset, loading, error }) {
   );
 }
 
-// ─── Loading screen ────────────────────────────────────────────────────────────
 function LoadingScreen() {
   return (
     <div style={S.uploadScreen}>
@@ -104,13 +107,13 @@ function LoadingScreen() {
   );
 }
 
-// ─── Main viewer ───────────────────────────────────────────────────────────────
 export default function App() {
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
-  const [currentPage, setCurrentPage] = useState(0); // 0-indexed
+  const [pdfDoc, setPdfDoc] = useState(null);
+  const [currentPage, setCurrentPage] = useState(0);
   const [hoveredBox, setHoveredBox] = useState(null);
   const [activeTypes, setActiveTypes] = useState(new Set(Object.keys(TYPE_COLORS)));
   const [showConfidence, setShowConfidence] = useState(false);
@@ -118,23 +121,39 @@ export default function App() {
 
   function reset() {
     setFile(null); setResult(null); setError(null);
-    setCurrentPage(0); setHoveredBox(null); setLoading(false);
+    setPdfDoc(null); setCurrentPage(0); setHoveredBox(null); setLoading(false);
   }
 
   async function handleExtract() {
     if (!file) return;
     setLoading(true);
     setError(null);
-    const formData = new FormData();
-    formData.append("file", file);
     try {
-      const res = await fetch("http://localhost:5000/extract-with-boxes", { method: "POST", body: formData });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Extraction failed");
-      setResult(data);
+      const { default: Docstrange } = await import("docstrange-api");
+      const client = new Docstrange({
+        apiKey: import.meta.env.VITE_DOCSTRANGE_API_KEY,
+        baseURL: window.location.origin + "/nanonets",
+        dangerouslyAllowBrowser: true,
+      });
+
+      const [data, arrayBuffer] = await Promise.all([
+        client.extract.sync({
+          output_format: "markdown",
+          include_metadata: "bounding_boxes",
+          file: file
+        }),
+        file.arrayBuffer(),
+      ]);
+
+      const markdown = data.result?.markdown ?? {};
+      const content = markdown.content ?? "";
+      const elements = markdown.metadata?.bounding_boxes?.elements ?? [];
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      setResult({ content, bounding_boxes: elements });
+      setPdfDoc(pdf);
       setCurrentPage(0);
     } catch (err) {
-      setError(err.message);
+      setError(err.message || String(err));
     } finally {
       setLoading(false);
     }
@@ -152,17 +171,11 @@ export default function App() {
   if (!result && !loading) return <ConfirmScreen file={file} onExtract={handleExtract} onReset={reset} loading={loading} error={error} />;
   if (loading) return <LoadingScreen />;
 
-  const pages = result.pages || [];
-  const totalPages = pages.length;
-  const page = pages[currentPage];
+  const totalPages = pdfDoc ? pdfDoc.numPages : 0;
   const allBoxes = result.bounding_boxes || [];
 
   const rawType = (el) => el.type || "default";
-
-  // Boxes for current page (API uses 1-indexed pages)
   const pageBoxes = allBoxes.filter((el) => (el.page ?? 1) === currentPage + 1);
-
-  // Known type order; unknown API types sort alphabetically at the end before "default"
   const TYPE_ORDER = Object.keys(TYPE_COLORS);
   const allTypes = [...new Set(allBoxes.map(rawType))].sort((a, b) => {
     const ai = TYPE_ORDER.indexOf(a);
@@ -173,7 +186,6 @@ export default function App() {
     return a.localeCompare(b);
   });
 
-  // Count per type across all boxes
   const typeCounts = allBoxes.reduce((acc, el) => {
     const t = rawType(el);
     acc[t] = (acc[t] || 0) + 1;
@@ -246,7 +258,6 @@ export default function App() {
           <Section label="Elements" badge={`${allBoxes.length} total`}>
             {allTypes.map((type) => {
               const color = TYPE_COLORS[type] || TYPE_COLORS.default;
-              const toTitleCase = (s) => s.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
               const label = TYPE_COLORS[type] ? color.label : toTitleCase(type);
               const on = activeTypes.has(type);
               const count = typeCounts[type] || 0;
@@ -271,7 +282,6 @@ export default function App() {
           const el = allBoxes[hoveredBox];
           if (!el) return null;
           const color = TYPE_COLORS[el.type] || TYPE_COLORS.default;
-          const toTitleCase = (s) => s.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
           const typeLabel = TYPE_COLORS[el.type] ? color.label : toTitleCase(el.type || "default");
           return (
             <>
@@ -294,9 +304,10 @@ export default function App() {
 
       {/* ── Main viewer ── */}
       <main style={S.viewerMain}>
-        {page ? (
+        {pdfDoc ? (
           <PageView
-            page={page}
+            pdfDoc={pdfDoc}
+            pageIndex={currentPage}
             boxes={pageBoxes}
             activeTypes={activeTypes}
             showConfidence={showConfidence}
@@ -315,29 +326,33 @@ export default function App() {
   );
 }
 
-// ─── Page renderer with CSS-overlay boxes ─────────────────────────────────────
-function PageView({ page, boxes, activeTypes, showConfidence, hoveredBox, onHover, zoom, allBoxes }) {
-  const displayW = Math.round(page.width * zoom);
-  const displayH = Math.round(page.height * zoom);
+function PageView({ pdfDoc, pageIndex, boxes, activeTypes, showConfidence, hoveredBox, onHover, zoom, allBoxes }) {
+  const canvasRef = useRef(null);
+  const [dims, setDims] = useState({ width: 0, height: 0 });
+
+  useEffect(() => {
+    if (!pdfDoc) return;
+    let cancelled = false;
+    (async () => {
+      const page = await pdfDoc.getPage(pageIndex + 1);
+      const viewport = page.getViewport({ scale: zoom });
+      const canvas = canvasRef.current;
+      if (!canvas || cancelled) return;
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      setDims({ width: viewport.width, height: viewport.height });
+      await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+    })();
+    return () => { cancelled = true; };
+  }, [pdfDoc, pageIndex, zoom]);
 
   return (
     <div style={S.pageOuter}>
       <div
-        style={{
-          ...S.pageWrapper,
-          width: displayW,
-          height: displayH,
-        }}
+        style={{ ...S.pageWrapper, width: dims.width || "auto", height: dims.height || "auto" }}
         onMouseLeave={() => onHover(null)}
       >
-        {/* The actual page image */}
-        <img
-          src={`data:image/png;base64,${page.image}`}
-          width={displayW}
-          height={displayH}
-          style={S.pageImg}
-          draggable={false}
-        />
+        <canvas ref={canvasRef} style={S.pageImg} />
 
         {/* Overlay: one div per box, positioned with % coords */}
         {boxes.map((el, idx) => {
@@ -367,7 +382,6 @@ function PageView({ page, boxes, activeTypes, showConfidence, hoveredBox, onHove
               }}
               onMouseEnter={() => onHover(allBoxes.indexOf(el))}
             >
-              {/* Confidence badge top-right */}
               {showConfidence && conf !== null && (
                 <span style={{
                   position: "absolute",
@@ -395,7 +409,6 @@ function PageView({ page, boxes, activeTypes, showConfidence, hoveredBox, onHove
   );
 }
 
-// ─── Small reusable UI bits ───────────────────────────────────────────────────
 function Section({ label, badge, children }) {
   return (
     <div style={S.section}>
@@ -434,7 +447,6 @@ function Toggle({ on, color, onToggle, size = "md" }) {
   );
 }
 
-// ─── Icon helpers ─────────────────────────────────────────────────────────────
 function FileIcon({ size = 20, color = "#2563eb" }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2">
@@ -466,7 +478,6 @@ function ChevronRight() {
   return <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="9 18 15 12 9 6"/></svg>;
 }
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
 const S = {
   uploadScreen: {
     minHeight: "100vh", width: "100%", display: "flex", alignItems: "center", justifyContent: "center",
